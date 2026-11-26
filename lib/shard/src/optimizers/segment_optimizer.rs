@@ -68,6 +68,13 @@ impl<O: SegmentOptimizer + ?Sized> OptimizationStrategy for ShardOptimizationStr
             .segment_optimizer_config()
             .live_vector_names()
     }
+
+    fn audit_policy(&self) -> segment::index::filter_index_audit::AuditPolicy {
+        self.optimizer
+            .segment_optimizer_config()
+            .audit_policy
+            .clone()
+    }
 }
 
 /// SegmentOptimizer - trait implementing common functionality of the optimizers
@@ -338,6 +345,15 @@ pub trait SegmentOptimizer: Sync {
             feature_flags(),
         )?;
         builder.set_cache_after_build(self.segment_optimizer_config().cache_after_build);
+
+        // Inject the live collection payload schema so a merge can pick one schema for a field
+        // whose sources disagree, and enable the pre-publish filter-index audit. When no live
+        // source is configured these stay at their conservative defaults (conflict errors out,
+        // auditing off), preserving the historical behavior.
+        if let Some(live_schema) = self.segment_optimizer_config().live_payload_schema() {
+            builder.set_live_payload_schema(live_schema);
+        }
+        builder.set_audit_policy(self.segment_optimizer_config().audit_policy.clone());
         Ok(builder)
     }
 

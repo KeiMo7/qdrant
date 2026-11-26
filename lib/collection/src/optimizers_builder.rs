@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
+use common::save_on_disk::SaveOnDisk;
 use common::types::PointOffsetType;
 use fs_err as fs;
 use schemars::JsonSchema;
@@ -17,14 +18,15 @@ use shard::files::SEGMENTS_PATH;
 use shard::operations::optimization::OptimizerThresholds;
 use shard::optimizers::config::{
     DEFAULT_DELETED_THRESHOLD, DEFAULT_VACUUM_MIN_VECTOR_NUMBER, DenseVectorOptimizerConfig,
-    LiveVectorNamesProvider, SegmentOptimizerConfig, SparseVectorOptimizerConfig,
-    TEMP_SEGMENTS_PATH, get_deferred_points_threshold_bytes, get_indexing_threshold_kb,
-    get_max_segment_size_kb, get_number_segments,
+    LivePayloadSchemaProvider, LiveVectorNamesProvider, SegmentOptimizerConfig,
+    SparseVectorOptimizerConfig, TEMP_SEGMENTS_PATH, get_deferred_points_threshold_bytes,
+    get_indexing_threshold_kb, get_max_segment_size_kb, get_number_segments,
 };
 use shard::optimizers::segment_optimizer::max_num_indexing_threads;
 use tokio::sync::RwLock as TokioRwLock;
 use validator::Validate;
 
+use crate::collection::payload_index_schema::PayloadIndexSchema;
 use crate::collection_manager::optimizers::config_mismatch_optimizer::ConfigMismatchOptimizer;
 use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
 use crate::collection_manager::optimizers::merge_optimizer::MergeOptimizer;
@@ -260,6 +262,8 @@ pub fn build_segment_optimizer_config(
         dense_vectors,
         sparse_vectors,
         live_vector_names: None,
+        live_payload_schema: Default::default(),
+        audit_policy: Default::default(),
         cache_after_build: CacheAfterBuild::Drop,
     }
 }
@@ -275,6 +279,12 @@ fn live_vector_names_provider(
     LiveVectorNamesProvider::new(move || collection_config.blocking_read().params.vector_names())
 }
 
+/// Build the optimizer set for a shard.
+///
+/// `payload_index_schema` is the shard's live payload index schema, used to arbitrate conflicting
+/// field schemas during a merge; `None` keeps conflicts as hard errors (tests and embeddable
+/// callers without a schema source).
+#[allow(clippy::too_many_arguments)]
 pub fn build_optimizers(
     shard_path: &Path,
     collection_config: Arc<TokioRwLock<CollectionConfigInternal>>,
@@ -283,12 +293,22 @@ pub fn build_optimizers(
     hnsw_config: &HnswConfig,
     hnsw_global_config: &HnswGlobalConfig,
     quantization_config: &Option<QuantizationConfig>,
+    payload_index_schema: Option<Arc<SaveOnDisk<PayloadIndexSchema>>>,
 ) -> Arc<Vec<Arc<Optimizer>>> {
     let segments_path = shard_path.join(SEGMENTS_PATH);
     let temp_segments_path = shard_path.join(TEMP_SEGMENTS_PATH);
-    let segment_config =
+    let mut segment_config =
         build_segment_optimizer_config(collection_params, hnsw_config, quantization_config)
             .with_live_vector_names(live_vector_names_provider(collection_config));
+
+    // The optimization worker runs on a blocking thread, so a synchronous read of the live
+    // payload schema through its parking-lot lock is safe there, mirroring the vector names
+    // provider. Without a schema source the field stays unset and conflicts keep erroring out.
+    if let Some(schema) = payload_index_schema {
+        let provider = LivePayloadSchemaProvider::new(move || schema.read().schema.clone());
+        segment_config = segment_config.with_live_payload_schema(provider);
+    }
+    let segment_config = segment_config;
     let num_indexing_threads = max_num_indexing_threads(&segment_config);
     let threshold_config = optimizers_config.optimizer_thresholds(
         num_indexing_threads,

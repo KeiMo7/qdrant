@@ -94,6 +94,8 @@ mod tests {
             dense_vectors,
             sparse_vectors,
             live_vector_names: None,
+            live_payload_schema: Default::default(),
+            audit_policy: Default::default(),
             cache_after_build: CacheAfterBuild::Drop,
         }
     }

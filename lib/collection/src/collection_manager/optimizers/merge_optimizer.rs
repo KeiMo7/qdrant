@@ -77,6 +77,8 @@ mod tests {
             dense_vectors,
             sparse_vectors: Default::default(),
             live_vector_names: None,
+            live_payload_schema: Default::default(),
+            audit_policy: Default::default(),
             cache_after_build: CacheAfterBuild::Drop,
         }
     }
@@ -288,6 +290,118 @@ mod tests {
             assert_eq!(
                 result, expected,
                 "Failed on ({default_segment_number}, {max_segment_size})"
+            );
+        }
+    }
+
+    /// A merge with field-index, payload and point-delete operations queued on the proxy while the
+    /// build runs must finish with a fully clean filter-index audit on the new segment, and the
+    /// source segments must be gone after the post-flush cleanup.
+    #[test]
+    fn test_merge_optimizer_audit_clean_with_proxy_operations() {
+        use segment::entry::ReadSegmentEntry as _;
+        use segment::index::filter_index_audit::{AuditMode, AuditPolicy, audit_with_segment_uuid};
+        use segment::types::{PayloadFieldSchema, PayloadSchemaType};
+
+        let _scope = common::ambient::test_guard();
+
+        let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+        let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
+        let dim = 256;
+
+        let mut holder = SegmentHolder::default();
+        let segments_to_merge = [
+            holder.add_new(random_segment(dir.path(), 100, 20, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 20, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 20, dim)),
+        ];
+
+        // Index the `number` field the fixture fills, before the merge: the proxy then has to
+        // propagate the index creation into the optimized segment while it is being built.
+        let number_field: segment::types::PayloadKeyType = "number".parse().unwrap();
+        for segment_id in segments_to_merge {
+            let locked = holder.get(segment_id).unwrap();
+            let mut segment = locked.get().write();
+            segment
+                .create_field_index(
+                    200,
+                    &number_field,
+                    Some(&PayloadFieldSchema::from(PayloadSchemaType::Integer)),
+                )
+                .unwrap();
+        }
+
+        let mut merge_optimizer = get_merge_optimizer(dir.path(), temp_dir.path(), dim, None);
+        // Turn the pre-publish audit on for this optimizer.
+        merge_optimizer
+            .segment_optimizer_config_mut_for_test()
+            .audit_policy = AuditPolicy {
+            mode: AuditMode::Full,
+            sample_size: 1024,
+            point_budget: usize::MAX,
+            max_divergences: 64,
+        };
+        merge_optimizer.set_default_segments_number_for_test(1);
+
+        let locked_holder = LockedSegmentHolder::new(holder);
+        let suggested = merge_optimizer.plan_optimizations_for_test(&locked_holder);
+        let batch = suggested.into_iter().exactly_one().unwrap();
+        assert_eq!(batch.len(), 3);
+
+        let old_paths: Vec<_> = batch
+            .iter()
+            .map(|sid| match locked_holder.read().get(*sid).unwrap() {
+                LockedSegment::Original(x) => x.read().segment_path.clone(),
+                LockedSegment::Proxy(_) => panic!("not expected before the merge"),
+            })
+            .collect();
+
+        merge_optimizer.optimize_for_test(locked_holder.clone(), batch);
+
+        // Exactly one segment remains from the merged batch; its audit must be clean.
+        // The merge produces one optimized segment plus, when every appendable segment was part
+        // of the batch, an extra COW segment to keep accepting writes.
+        let remaining: Vec<_> = locked_holder
+            .read()
+            .iter()
+            .map(|(id, locked)| (id, locked.clone()))
+            .collect();
+        assert!(
+            (1..=2).contains(&remaining.len()),
+            "the sources must merge into one optimized segment (plus an optional COW segment)"
+        );
+        // The largest segment by point count is the merged result.
+        let merged_locked = remaining
+            .iter()
+            .map(|(_, locked)| locked.clone())
+            .max_by_key(|locked| locked.get().read().available_point_count())
+            .unwrap();
+        let new_segment = match &merged_locked {
+            LockedSegment::Original(arc) => arc.read(),
+            LockedSegment::Proxy(_) => panic!("the merged segment must not be a proxy"),
+        };
+        assert!(new_segment.available_point_count() >= 60);
+        let report = audit_with_segment_uuid(
+            &new_segment.payload_index.borrow(),
+            &AuditPolicy::full(),
+            new_segment.uuid,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(
+            report.is_clean(),
+            "merged segment must have a clean filter-index audit: {report:?}"
+        );
+
+        // The post-flush action removes the old segment directories once durability is confirmed.
+        locked_holder
+            .read()
+            .flush_all(FlushMode::Sync, true)
+            .expect("flush must succeed");
+        for path in old_paths {
+            assert!(
+                !path.exists(),
+                "source segment {path:?} must be removed after flush"
             );
         }
     }

@@ -5,12 +5,14 @@ use std::sync::Arc;
 
 use segment::common::BYTES_IN_KB;
 use segment::data_types::modifier::Modifier;
+use segment::index::filter_index_audit::AuditPolicy;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::segment_constructor::cache_after_build::CacheAfterBuild;
 use segment::types::{
-    Distance, HnswConfig, Indexes, Memory, MultiVectorConfig, PayloadStorageType,
-    QuantizationConfig, SegmentConfig, SparseVectorDataConfig, SparseVectorStorageType,
-    VectorDataConfig, VectorNameBuf, VectorStorageDatatype, VectorStorageType,
+    Distance, HnswConfig, Indexes, Memory, MultiVectorConfig, PayloadFieldSchema, PayloadKeyType,
+    PayloadStorageType, QuantizationConfig, SegmentConfig, SparseVectorDataConfig,
+    SparseVectorStorageType, VectorDataConfig, VectorNameBuf, VectorStorageDatatype,
+    VectorStorageType,
 };
 
 pub const TEMP_SEGMENTS_PATH: &str = "temp_segments";
@@ -141,6 +143,36 @@ impl fmt::Debug for LiveVectorNamesProvider {
     }
 }
 
+/// Live read of the collection's current payload index schema.
+///
+/// Mirrors [`LiveVectorNamesProvider`]: the optimizer config is a frozen snapshot, but a merge may
+/// need the *current* payload schema to arbitrate between source segments that carry different
+/// schemas for the same field. Wrapped in a newtype so the config can keep deriving `Debug`.
+#[derive(Clone, Default)]
+pub struct LivePayloadSchemaProvider(
+    Option<Arc<dyn Fn() -> HashMap<PayloadKeyType, PayloadFieldSchema> + Send + Sync>>,
+);
+
+impl LivePayloadSchemaProvider {
+    pub fn new(
+        read: impl Fn() -> HashMap<PayloadKeyType, PayloadFieldSchema> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Some(Arc::new(read)))
+    }
+
+    /// The collection's current payload index schema, if a live source was wired in.
+    pub fn get(&self) -> Option<HashMap<PayloadKeyType, PayloadFieldSchema>> {
+        self.0.as_ref().map(|read| read())
+    }
+}
+
+impl fmt::Debug for LivePayloadSchemaProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LivePayloadSchemaProvider")
+            .finish_non_exhaustive()
+    }
+}
+
 /// This configuration contains all necessary information to build an optimized segment.
 #[derive(Debug, Clone)]
 pub struct SegmentOptimizerConfig {
@@ -153,6 +185,11 @@ pub struct SegmentOptimizerConfig {
     /// Live read of the collection's vector names, when wired in via
     /// [`SegmentOptimizerConfig::with_live_vector_names`]. `None` if no live source is available.
     pub live_vector_names: Option<LiveVectorNamesProvider>,
+    /// Live read of the collection's payload index schema, used to arbitrate conflicting source
+    /// field schemas during a merge. `None` keeps the historical behavior (a conflict errors out).
+    pub live_payload_schema: LivePayloadSchemaProvider,
+    /// Policy for the pre-publish filter-index audit on a freshly built segment.
+    pub audit_policy: AuditPolicy,
     /// See [`CacheAfterBuild`].
     pub cache_after_build: CacheAfterBuild,
 }
@@ -187,6 +224,25 @@ impl SegmentOptimizerConfig {
         self.live_vector_names
             .as_ref()
             .map(LiveVectorNamesProvider::get)
+    }
+
+    /// Attach a live read of the collection's payload index schema.
+    #[must_use]
+    pub fn with_live_payload_schema(mut self, provider: LivePayloadSchemaProvider) -> Self {
+        self.live_payload_schema = provider;
+        self
+    }
+
+    /// The collection's current payload index schema, if a live source was wired in.
+    pub fn live_payload_schema(&self) -> Option<HashMap<PayloadKeyType, PayloadFieldSchema>> {
+        self.live_payload_schema.get()
+    }
+
+    /// Attach a filter-index audit policy for segments built by this optimizer.
+    #[must_use]
+    pub fn with_audit_policy(mut self, policy: AuditPolicy) -> Self {
+        self.audit_policy = policy;
+        self
     }
 }
 

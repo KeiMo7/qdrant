@@ -81,6 +81,12 @@ pub trait OptimizationStrategy: Send {
     /// genuinely deleted vector (safe to prune) from the CreateVectorName-vs-optimizer race (must
     /// cancel). See [`SegmentBuilder::set_live_vector_names`].
     fn live_vector_names(&self) -> Option<HashSet<VectorNameBuf>>;
+
+    /// Filter-index audit policy for the final pre-publish verification in `finish_optimization`.
+    ///
+    /// [`AuditMode::Off`] skips the audit entirely, preserving the historical optimizer cost
+    /// profile; this is the default.
+    fn audit_policy(&self) -> segment::index::filter_index_audit::AuditPolicy;
 }
 
 /// Restores original segments from proxies
@@ -141,6 +147,76 @@ fn cleanup_cancelled_optimized_segment(segments_path: &Path, output_segment_uuid
             orphan_path.display(),
         );
     }
+}
+
+/// Audit the optimized segment's filter indexes after the final proxy propagation and flush.
+///
+/// This is the final gate after the second proxy propagation and the hard flush, so its view
+/// includes every `ProxyIndexChange`, `set_payload`, `clear_payload` and point delete that landed
+/// during the optimization (never the snapshot `build_new_segment` started from). Repairable
+/// divergences trigger a field rebuild and a second audit; fatal divergences, or a repair that
+/// does not converge, surface as a service error before the segment is made loadable.
+//
+// The `&mut` is required semantically even though the mutation goes through the payload index's
+// interior mutability: callers must hold exclusive access to a segment that may be rebuilt.
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn audit_optimized_segment(
+    optimized_segment: &mut Segment,
+    policy: &segment::index::filter_index_audit::AuditPolicy,
+    stopped: &AtomicBool,
+) -> OperationResult<()> {
+    use segment::index::PayloadIndex as _;
+    use segment::index::filter_index_audit::{
+        RepairPlan, SegmentLifecycle, Severity, audit_with_segment_uuid,
+    };
+
+    let segment_uuid = optimized_segment.uuid;
+
+    let report = {
+        let payload_index = optimized_segment.payload_index.borrow();
+        audit_with_segment_uuid(&payload_index, policy, segment_uuid, stopped)?
+    };
+
+    if report.highest_severity == Severity::Fatal {
+        return Err(OperationError::service_error(format!(
+            "filter-index audit of optimized segment {segment_uuid} found a fatal divergence: \
+             {report:?}"
+        )));
+    }
+    if report.is_clean() {
+        return Ok(());
+    }
+
+    let plan = RepairPlan::from_report(&report);
+    log::warn!(
+        "filter-index audit of optimized segment {segment_uuid} found divergences on fields \
+         {:?}; rebuilding before publish",
+        plan.fields(),
+    );
+    {
+        let mut payload_index = optimized_segment.payload_index.borrow_mut();
+        let outcome =
+            payload_index.repair_filter_indexes(&plan, SegmentLifecycle::Unpublished, stopped)?;
+        log::info!(
+            "filter-index repair on optimized segment {segment_uuid}: rebuilt {:?}, skipped {:?}",
+            outcome.rebuilt,
+            outcome.skipped,
+        );
+        // The repair itself flushes every rebuilt index; persist the segment-level flush ordering.
+        payload_index.flusher()()?;
+    }
+
+    let second_report = {
+        let payload_index = optimized_segment.payload_index.borrow();
+        audit_with_segment_uuid(&payload_index, policy, segment_uuid, stopped)?
+    };
+    if !second_report.is_clean() {
+        return Err(OperationError::service_error(format!(
+            "filter-index audit of optimized segment {segment_uuid} still reports divergences \
+             after repair: {second_report:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// Read locks of the given proxies, taken one at a time.
@@ -415,6 +491,7 @@ fn finish_optimization(
     applied_changes: &ProxyChanges,
     proxy_ids: &[SegmentId],
     cow_segment_id_opt: Option<SegmentId>,
+    audit_policy: &segment::index::filter_index_audit::AuditPolicy,
     stopped: &AtomicBool,
 ) -> OperationResult<usize> {
     // This block locks all write operations with collection. It should be fast.
@@ -436,6 +513,17 @@ fn finish_optimization(
     // therefore flush this segment to persist the changes in a new location. WAL recovery would
     // not help us here, because all proapgated changes are already acknowledged in the WAL.
     optimized_segment.flush(true)?;
+
+    // Pre-publish filter-index verification. This is the state after the second proxy propagation
+    // and the hard flush above — not the snapshot `build_new_segment` started from — so every
+    // ProxyIndexChange, set_payload, clear_payload and delete_point that landed during the
+    // optimization is reflected. Gated on a non-Off policy so the default optimizer path keeps its
+    // historical cost profile. A fatal divergence, or a repair that does not converge, aborts
+    // before the version file is written: the segment directory is cleaned up by the caller's
+    // cancellation/error path and the proxies are rolled back, leaving the sources writable.
+    if audit_policy.mode != segment::index::filter_index_audit::AuditMode::Off {
+        audit_optimized_segment(&mut optimized_segment, audit_policy, stopped)?;
+    }
 
     // All propagated changes are applied and durable: make the segment loadable on restart.
     // `SegmentBuilder::build` postponed the version file exactly until this point (its `ready`
@@ -802,14 +890,12 @@ pub fn execute_optimization<F: ?Sized + OptimizationStrategy>(
     let (optimized_segment, applied_changes) = match build_result {
         Ok(result) => result,
         Err(err) => {
-            // A graceful cancellation always happens before the optimized segment is swapped into
-            // the holder, so the segment `build` already moved into `segments_path` is now an
-            // orphan that `Drop` won't remove. Delete it explicitly, before unwrapping the proxies
-            // so a failure there cannot leave it behind. Non-cancellation errors may occur after
-            // the swap, where the segment is live, so they are left untouched.
-            if matches!(err, OperationError::Cancelled { .. }) {
-                cleanup_cancelled_optimized_segment(&paths.segments_path, output_segment_uuid);
-            }
+            // Every failure here happens before the optimized segment is swapped into the holder,
+            // so the directory `build` already moved into `segments_path` is an orphan that
+            // `Drop` won't remove. This includes filter-index audit/repair failures, not just
+            // graceful cancellations: delete it before unwrapping the proxies so a failure there
+            // cannot leave it behind, and the sources become writable again.
+            cleanup_cancelled_optimized_segment(&paths.segments_path, output_segment_uuid);
             // Properly cancel optimization on all error kinds
             // Unwrap proxies and add temp segment to holder
             unwrap_proxy(&segment_holder, &proxy_ids)?;
@@ -818,6 +904,7 @@ pub fn execute_optimization<F: ?Sized + OptimizationStrategy>(
     };
 
     // Fast part: blocks updates, propagates rest of the changes, swaps optimized segment
+    let audit_policy = factory.audit_policy();
     let points_count = match finish_optimization(
         &segment_holder,
         locked_proxies,
@@ -825,18 +912,16 @@ pub fn execute_optimization<F: ?Sized + OptimizationStrategy>(
         &applied_changes,
         &proxy_ids,
         cow_segment_id_opt,
+        &audit_policy,
         stopped,
     ) {
         Ok(points_count) => points_count,
         Err(err) => {
-            // A graceful cancellation always happens before the optimized segment is swapped into
-            // the holder, so the segment `build` already moved into `segments_path` is now an
-            // orphan that `Drop` won't remove. Delete it explicitly, before unwrapping the proxies
-            // so a failure there cannot leave it behind. Non-cancellation errors may occur after
-            // the swap, where the segment is live, so they are left untouched.
-            if matches!(err, OperationError::Cancelled { .. }) {
-                cleanup_cancelled_optimized_segment(&paths.segments_path, output_segment_uuid);
-            }
+            // `finish_optimization` performs the swap itself; anything it returns before that
+            // swap (including the filter-index audit and repair inserted between flush and
+            // version save) leaves the built directory unpublished. Remove it in every such case
+            // rather than only on cancellation, then unwrap the proxies so the sources recover.
+            cleanup_cancelled_optimized_segment(&paths.segments_path, output_segment_uuid);
             // Properly cancel optimization on all error kinds
             // Unwrap proxies and add temp segment to holder
             unwrap_proxy(&segment_holder, &proxy_ids)?;
@@ -856,6 +941,7 @@ mod tests {
     use common::flags::{FeatureFlags, init_feature_flags};
     use common::types::DeferredBehavior;
     use segment::entry::NonAppendableSegmentEntry as _;
+    use segment::index::filter_index_audit::AuditPolicy;
     use tempfile::Builder;
 
     use super::*;
@@ -966,6 +1052,9 @@ mod tests {
         use segment::data_types::vector_name_config::{DenseVectorConfig, VectorNameConfig};
         use segment::types::{Distance, PayloadFieldSchema, PayloadKeyType, PayloadSchemaType};
 
+        // The pre-publish filter-index audit reads gridstore-backed indexes.
+        let _scope = common::ambient::test_guard();
+
         let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
 
         let wrapped = LockedSegment::new(build_segment_1(dir.path()));
@@ -1013,6 +1102,7 @@ mod tests {
             &ProxyChanges::default(),
             &[segment_id],
             None,
+            &AuditPolicy::off(),
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1049,6 +1139,9 @@ mod tests {
     fn finish_optimization_propagates_only_changes_since_first_pass() {
         use segment::data_types::vector_name_config::{DenseVectorConfig, VectorNameConfig};
         use segment::types::{Distance, PayloadFieldSchema, PayloadKeyType, PayloadSchemaType};
+
+        // The pre-publish filter-index audit reads gridstore-backed indexes.
+        let _scope = common::ambient::test_guard();
 
         let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
 
@@ -1106,6 +1199,7 @@ mod tests {
             &applied_changes,
             &[segment_id],
             None,
+            &AuditPolicy::off(),
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1223,6 +1317,7 @@ mod tests {
             &ProxyChanges::default(),
             &[segment_id],
             None,
+            &AuditPolicy::off(),
             &AtomicBool::new(false),
         );
         POST_SWAP_FAILURE_HOOK.with(|hook| *hook.borrow_mut() = None);

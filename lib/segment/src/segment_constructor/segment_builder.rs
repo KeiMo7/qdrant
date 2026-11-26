@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cmp;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::path::Path;
@@ -39,6 +39,9 @@ use crate::id_tracker::immutable_id_tracker::ImmutableIdTracker;
 use crate::id_tracker::in_memory_id_tracker::InMemoryIdTracker;
 use crate::id_tracker::{IdTracker, IdTrackerEnum, IdTrackerRead, for_each_unique_point};
 use crate::index::field_index::FieldIndex;
+use crate::index::filter_index_audit::{
+    AuditMode, AuditPolicy, RepairPlan, SegmentLifecycle, Severity, audit_with_segment_uuid,
+};
 use crate::index::sparse_index::sparse_vector_index::SparseVectorIndexOpenArgs;
 use crate::index::struct_payload_index::{IndexLoadMode, StorageType, StructPayloadIndex};
 use crate::index::{PayloadIndex, PayloadIndexRead, VectorIndexEnum};
@@ -73,8 +76,22 @@ pub struct SegmentBuilder {
     temp_dir: TempDir,
     indexed_fields: HashMap<PayloadKeyType, PayloadFieldSchema>,
 
+    // Every schema observed for a field across the source segments, in encounter order. Used to
+    // detect fields whose sources disagree and reconcile them against the live payload schema
+    // before building the index exactly once.
+    source_field_schemas: BTreeMap<PayloadKeyType, Vec<PayloadFieldSchema>>,
+
     // Payload key to defragment data to
     defragment_keys: Vec<PayloadKeyType>,
+
+    // The collection's current payload index schema, if a live source is wired in. Used to pick a
+    // unique schema when source segments carry different schemas for the same field (see
+    // `set_live_payload_schema`). `None` means no live source: conflicting source schemas abort
+    // the merge instead of being guessed.
+    live_payload_schema: Option<HashMap<PayloadKeyType, PayloadFieldSchema>>,
+
+    // Policy for the pre-publish filter-index audit. `Off` keeps the historical behavior.
+    audit_policy: AuditPolicy,
 
     // Vector names that currently exist in the live collection schema. Used to decide what to do
     // with a source vector name that is absent from this builder's (frozen) target schema:
@@ -160,7 +177,10 @@ impl SegmentBuilder {
             feature_flags,
             temp_dir,
             indexed_fields: Default::default(),
+            source_field_schemas: Default::default(),
             defragment_keys: vec![],
+            live_payload_schema: None,
+            audit_policy: AuditPolicy::off(),
             cache_after_build: CacheAfterBuild::Drop,
             live_vector_names: None,
         })
@@ -168,6 +188,22 @@ impl SegmentBuilder {
 
     pub fn set_defragment_keys(&mut self, keys: Vec<PayloadKeyType>) {
         self.defragment_keys = keys;
+    }
+
+    /// Inject the collection's current payload index schema.
+    ///
+    /// Source segments can carry different [`PayloadFieldSchema`]s for one field (different
+    /// `on_disk`, `enable_hnsw`, or even field type). When that happens the merge must build the
+    /// index exactly once, under the collection's authoritative live schema, instead of inserting
+    /// both into `indexed_fields` and letting the last write win silently. Without a live source
+    /// a conflict stays an error (see `reconcile_indexed_fields`).
+    pub fn set_live_payload_schema(&mut self, schema: HashMap<PayloadKeyType, PayloadFieldSchema>) {
+        self.live_payload_schema = Some(schema);
+    }
+
+    /// Set the filter-index audit policy applied to the built segment before it is published.
+    pub fn set_audit_policy(&mut self, policy: AuditPolicy) {
+        self.audit_policy = policy;
     }
 
     /// Set the vector names that currently exist in the live collection schema.
@@ -528,11 +564,50 @@ impl SegmentBuilder {
 
         for payload in payloads {
             for (field, payload_schema) in payload.with_view(|v| v.indexed_fields()) {
+                let schemas = self.source_field_schemas.entry(field.clone()).or_default();
+                if !schemas.contains(&payload_schema) {
+                    schemas.push(payload_schema.clone());
+                }
                 self.indexed_fields.insert(field, payload_schema);
             }
         }
 
         Ok(true)
+    }
+
+    /// Reconcile fields whose source segments carry different schemas.
+    ///
+    /// Called after proxy index changes were folded in. For every field observed with more than
+    /// one distinct schema across the sources:
+    /// - with a live payload schema, adopt it as the single target schema;
+    /// - without one, return an error naming the field and both schemas, so no new segment is
+    ///   built from an arbitrary pick.
+    fn reconcile_indexed_fields(&mut self) -> OperationResult<()> {
+        let conflicts: Vec<_> = self
+            .source_field_schemas
+            .iter()
+            .filter(|(_, schemas)| schemas.len() > 1)
+            .map(|(field, schemas)| (field.clone(), schemas.clone()))
+            .collect();
+
+        for (field, schemas) in conflicts {
+            let Some(live_schema) = self
+                .live_payload_schema
+                .as_ref()
+                .and_then(|live| live.get(&field))
+            else {
+                return Err(OperationError::service_error(format!(
+                    "Cannot merge field `{field}`: source segments carry conflicting payload \
+                     schemas {schemas:?} and no live payload schema is available to arbitrate"
+                )));
+            };
+            log::debug!(
+                "Resolving conflicting schemas for field `{field}` using the live collection \
+                 schema: {live_schema:?}"
+            );
+            self.indexed_fields.insert(field, live_schema.clone());
+        }
+        Ok(())
     }
 
     /// Test wrapper for [`SegmentBuilder::build`].
@@ -570,6 +645,11 @@ impl SegmentBuilder {
         rng: &mut R,
         progress_segment: ProgressTracker,
     ) -> Result<Segment, OperationError> {
+        // Proxy index changes have already been folded into `indexed_fields`; resolve any field
+        // whose source segments disagree on a schema before an index is built for it.
+        let mut this = self;
+        this.reconcile_indexed_fields()?;
+
         let temp_dir = {
             let SegmentBuilder {
                 version,
@@ -581,10 +661,13 @@ impl SegmentBuilder {
                 feature_flags,
                 temp_dir,
                 indexed_fields,
+                source_field_schemas: _,
                 defragment_keys: _,
                 live_vector_names: _,
+                live_payload_schema: _,
+                audit_policy,
                 cache_after_build,
-            } = self;
+            } = this;
 
             let progress_quantization = progress_segment.subtask("quantization");
             let progress_payload_index = progress_segment.subtask("payload_index");
@@ -714,6 +797,15 @@ impl SegmentBuilder {
             drop(progress_payload_index);
 
             payload_index.flusher()()?;
+
+            // Pre-publish verification: the freshly built field indexes must agree with the
+            // payload storage and the deletion mask. Runs after every `set_indexed` and its flush,
+            // but before `Segment::save_state` — a failure here still discards the whole temp
+            // directory, so no half-valid segment is ever published.
+            if audit_policy.mode != AuditMode::Off {
+                audit_and_repay(&mut payload_index, &audit_policy, segment_uuid, stopped)?;
+            }
+
             let payload_index_arc = Arc::new(AtomicRefCell::new(payload_index));
 
             // Try to lock GPU device.
@@ -953,6 +1045,61 @@ impl SegmentBuilder {
         }
         Ok(())
     }
+}
+
+/// Audit a freshly built, still-unpublished payload index and repair any repairable divergence.
+///
+/// Fatal divergences (missing index, type mismatch, deleted points still indexed) abort the build:
+/// the caller discards the temp directory, so nothing invalid is published. Repairable divergences
+/// trigger a field rebuild followed by a second audit; if the rebuild does not produce a clean
+/// report the build aborts as well. Truncation only degrades the report and never blocks
+/// publication.
+fn audit_and_repay(
+    payload_index: &mut StructPayloadIndex,
+    policy: &AuditPolicy,
+    segment_uuid: Uuid,
+    stopped: &AtomicBool,
+) -> OperationResult<()> {
+    let report = audit_with_segment_uuid(payload_index, policy, segment_uuid, stopped)?;
+
+    if report.highest_severity == Severity::Fatal {
+        return Err(OperationError::service_error(format!(
+            "filter-index audit of segment {segment_uuid} found a fatal divergence: {report:?}"
+        )));
+    }
+
+    if report.is_clean() {
+        return Ok(());
+    }
+
+    // Only repairable (and possibly degraded) divergences remain.
+    let plan = RepairPlan::from_report(&report);
+    if plan.is_empty() {
+        return Ok(());
+    }
+    log::warn!(
+        "filter-index audit of segment {segment_uuid} found repairable divergences on fields \
+         {:?}; rebuilding them before publish",
+        plan.fields(),
+    );
+    let outcome =
+        payload_index.repair_filter_indexes(&plan, SegmentLifecycle::Unpublished, stopped)?;
+    log::info!(
+        "filter-index repair on segment {segment_uuid}: rebuilt {:?}, skipped {:?}",
+        outcome.rebuilt,
+        outcome.skipped,
+    );
+
+    // Re-audit after repair: a rebuild that still leaves divergences is a fatal condition for the
+    // merge rather than something to publish silently.
+    let second_report = audit_with_segment_uuid(payload_index, policy, segment_uuid, stopped)?;
+    if !second_report.is_clean() {
+        return Err(OperationError::service_error(format!(
+            "filter-index audit of segment {segment_uuid} still reports divergences after repair: \
+             {second_report:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn uuid_hash<I>(hash: &mut u64, ids: I)

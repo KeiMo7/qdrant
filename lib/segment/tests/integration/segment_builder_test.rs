@@ -1028,3 +1028,380 @@ fn test_building_new_segment_leaves_no_tracker_journal() {
             .exists()
     );
 }
+
+/// Merge two segments whose field schemas disagree, with one source missing the index, soft
+/// deletions, and duplicated array values. The merged segment's filter-visible point set must
+/// equal a brute-force payload evaluation, including is-null queries, and its filter-index audit
+/// must come back clean.
+#[test]
+fn test_merged_segment_filter_index_audit_matches_payload() {
+    use common::types::PointOffsetType;
+    use segment::index::PayloadIndexRead as _;
+    use segment::index::filter_index_audit::{AuditMode, AuditPolicy};
+    use segment::payload_storage::PayloadStorageRead as _;
+    use segment::types::{Condition, FieldCondition, Filter, IsNullCondition, Match, Payload};
+
+    let dir = Builder::new().prefix("merge_audit_dir").tempdir().unwrap();
+    let temp_dir = Builder::new().prefix("merge_audit_temp").tempdir().unwrap();
+    let stopped = AtomicBool::new(false);
+    let _scope = ambient::test_guard();
+
+    let color: PayloadKeyType = "color".parse().unwrap();
+    let tags: PayloadKeyType = "tags".parse().unwrap();
+
+    // Source segment 1: keyword index on `color`, duplicated array values on `tags`.
+    let mut segment1 = build_simple_segment_with_payload_storage(
+        dir.path(),
+        4,
+        Distance::Dot,
+        PayloadStorageType::default(),
+    )
+    .unwrap();
+    for i in 0..4u64 {
+        segment1
+            .upsert_point(i + 1, i.into(), only_default_vector(&[1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        let payload: Payload = serde_json::from_value(serde_json::json!({
+            "color": if i % 2 == 0 { "red" } else { "blue" },
+            // duplicated values must not double-index a point
+            "tags": ["a", "a", "b"],
+        }))
+        .unwrap();
+        segment1
+            .set_full_payload(i + 10, i.into(), &payload)
+            .unwrap();
+    }
+    segment1
+        .create_field_index(100, &color, Some(&PayloadSchemaType::Keyword.into()))
+        .unwrap();
+    // `tags` is intentionally not indexed on this source.
+    segment1.delete_point(200, 1.into()).unwrap();
+
+    // Source segment 2: same field with a different (params) schema, and `tags` indexed.
+    let mut segment2 = build_simple_segment_with_payload_storage(
+        dir.path(),
+        4,
+        Distance::Dot,
+        PayloadStorageType::default(),
+    )
+    .unwrap();
+    for i in 4..8u64 {
+        segment2
+            .upsert_point(i + 1, i.into(), only_default_vector(&[0.0, 1.0, 0.0, 0.0]))
+            .unwrap();
+        let payload: Payload = serde_json::from_value(serde_json::json!({
+            "color": if i % 2 == 0 { "red" } else { "green" },
+            "tags": ["b", "c"],
+        }))
+        .unwrap();
+        segment2
+            .set_full_payload(i + 10, i.into(), &payload)
+            .unwrap();
+    }
+    let color_schema = PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword);
+    segment2
+        .create_field_index(100, &color, Some(&color_schema))
+        .unwrap();
+    segment2
+        .create_field_index(101, &tags, Some(&PayloadSchemaType::Keyword.into()))
+        .unwrap();
+
+    let mut builder = SegmentBuilder::new(
+        temp_dir.path(),
+        &segment1.segment_config,
+        &HnswGlobalConfig::default(),
+        FeatureFlags::default(),
+    )
+    .unwrap();
+    builder.update(&[&segment1, &segment2], &stopped).unwrap();
+    builder.set_audit_policy(AuditPolicy {
+        mode: AuditMode::Full,
+        sample_size: 1024,
+        point_budget: usize::MAX,
+        max_divergences: 64,
+    });
+
+    let merged = builder
+        .build(
+            dir.path(),
+            Uuid::new_v4(),
+            None,
+            true,
+            ResourcePermit::dummy(1),
+            &stopped,
+            &mut rand::rng(),
+            ProgressTracker::new_for_test(),
+        )
+        .unwrap();
+
+    // Brute-force expectation over payload storage for the `color = red` filter.
+    let mut expected_red: Vec<PointOffsetType> = Vec::new();
+    let mut expected_null: Vec<PointOffsetType> = Vec::new();
+    let total = merged.id_tracker.borrow().total_point_count();
+    for internal_id in 0..total as PointOffsetType {
+        if merged.id_tracker.borrow().is_deleted_point(internal_id) {
+            continue;
+        }
+        let payload = merged.payload_storage.borrow().get(internal_id).unwrap();
+        let color_values = payload.get_value(&color);
+        if color_values.iter().any(|v| v.as_str() == Some("red")) {
+            expected_red.push(internal_id);
+        }
+        if color_values.is_empty() {
+            expected_null.push(internal_id);
+        }
+    }
+
+    let red_filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
+        color.clone(),
+        Match::new_value(segment::types::ValueVariants::String("red".to_string())),
+    )));
+    let null_filter = Filter::new_must(Condition::IsNull(IsNullCondition {
+        is_null: segment::types::PayloadField { key: color.clone() },
+    }));
+
+    let mut got_red = merged
+        .payload_index
+        .borrow()
+        .with_view(|v| v.query_points(&red_filter, &AtomicBool::new(false)))
+        .unwrap();
+    got_red.sort_unstable();
+    let mut got_null = merged
+        .payload_index
+        .borrow()
+        .with_view(|v| v.query_points(&null_filter, &AtomicBool::new(false)))
+        .unwrap();
+    got_null.sort_unstable();
+
+    assert_eq!(
+        got_red, expected_red,
+        "color=red filter must match payload evaluation"
+    );
+    assert_eq!(
+        got_null, expected_null,
+        "is-null filter must match payload evaluation"
+    );
+
+    // The built segment audits clean after the merge.
+    let report = merged
+        .payload_index
+        .borrow()
+        .audit_filter_indexes(
+            &AuditPolicy::full(),
+            Some(merged.uuid.as_u128() as u64),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(
+        report.is_clean(),
+        "merged segment must audit clean: {report:?}"
+    );
+    assert!(!report.truncated);
+}
+
+/// Without a live payload schema, a field whose source segments carry different schemas must
+/// abort the merge with an error naming the field and both schemas, before any new segment is
+/// produced.
+#[test]
+fn test_merge_aborts_on_conflicting_field_schemas_without_live_schema() {
+    use segment::types::Payload;
+    let dir = Builder::new()
+        .prefix("merge_conflict_dir")
+        .tempdir()
+        .unwrap();
+    let temp_dir = Builder::new()
+        .prefix("merge_conflict_temp")
+        .tempdir()
+        .unwrap();
+    let stopped = AtomicBool::new(false);
+    let _scope = ambient::test_guard();
+
+    let field: PayloadKeyType = "score".parse().unwrap();
+
+    let make_segment = |path: &Path, schema: PayloadFieldSchema| {
+        let mut segment = build_simple_segment_with_payload_storage(
+            path,
+            4,
+            Distance::Dot,
+            PayloadStorageType::default(),
+        )
+        .unwrap();
+        segment
+            .upsert_point(1, 1.into(), only_default_vector(&[1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        let payload: Payload = serde_json::from_value(serde_json::json!({ "score": 5 })).unwrap();
+        segment.set_full_payload(2, 1.into(), &payload).unwrap();
+        segment
+            .create_field_index(100, &field, Some(&schema))
+            .unwrap();
+        segment
+    };
+
+    let segment1 = make_segment(dir.path(), PayloadSchemaType::Integer.into());
+    let segment2 = make_segment(dir.path(), PayloadSchemaType::Float.into());
+
+    let mut builder = SegmentBuilder::new(
+        temp_dir.path(),
+        &segment1.segment_config,
+        &HnswGlobalConfig::default(),
+        FeatureFlags::default(),
+    )
+    .unwrap();
+    builder.update(&[&segment1, &segment2], &stopped).unwrap();
+
+    let result = builder.build(
+        dir.path(),
+        Uuid::new_v4(),
+        None,
+        true,
+        ResourcePermit::dummy(1),
+        &stopped,
+        &mut rand::rng(),
+        ProgressTracker::new_for_test(),
+    );
+    let err = result.expect_err("conflicting schemas without a live source must abort the merge");
+    let message = err.to_string();
+    assert!(
+        message.contains("score"),
+        "error must name the field: {message}"
+    );
+    assert!(
+        message.contains("conflicting payload schemas"),
+        "error must describe the conflict: {message}"
+    );
+}
+
+/// A segment built without a version file (a build aborted before publication) is discarded by
+/// `normalize_segment_dir`, so a crash between the build and the version save never publishes a
+/// half-finished segment.
+#[test]
+fn test_unversioned_built_segment_is_discarded_by_normalize() {
+    use segment::segment_constructor::normalize_segment_dir;
+
+    let dir = Builder::new()
+        .prefix("audit_unversioned_dir")
+        .tempdir()
+        .unwrap();
+    let temp_dir = Builder::new()
+        .prefix("audit_unversioned_temp")
+        .tempdir()
+        .unwrap();
+    let stopped = AtomicBool::new(false);
+    let _scope = ambient::test_guard();
+
+    let mut source = build_simple_segment_with_payload_storage(
+        dir.path(),
+        4,
+        Distance::Dot,
+        PayloadStorageType::default(),
+    )
+    .unwrap();
+    source
+        .upsert_point(1, 1.into(), only_default_vector(&[1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
+
+    let builder = SegmentBuilder::new(
+        temp_dir.path(),
+        &source.segment_config,
+        &HnswGlobalConfig::default(),
+        FeatureFlags::default(),
+    )
+    .unwrap();
+    let builder = {
+        let mut b = builder;
+        b.update(&[&source], &stopped).unwrap();
+        b
+    };
+
+    // `ready = false` reproduces the pre-publish state: no version file is written.
+    let segment = builder
+        .build(
+            dir.path(),
+            Uuid::new_v4(),
+            None,
+            false,
+            ResourcePermit::dummy(1),
+            &stopped,
+            &mut rand::rng(),
+            ProgressTracker::new_for_test(),
+        )
+        .unwrap();
+
+    assert!(!segment.segment_path.join(VERSION_FILE).exists());
+    assert!(
+        normalize_segment_dir(&segment.segment_path)
+            .unwrap()
+            .is_none(),
+        "a segment without a version file must be discarded"
+    );
+}
+
+/// A fatal divergence (a deleted point still indexed) is reported with Fatal severity, and the
+/// same gate `SegmentBuilder` uses refuses to publish such a segment.
+#[test]
+fn test_fatal_divergence_is_reported_and_blocks_publish() {
+    use segment::index::field_index::FieldIndex;
+    use segment::index::filter_index_audit::{
+        AuditPolicy, RepairPlan, SegmentLifecycle, Severity, audit_with_segment_uuid,
+    };
+    use segment::types::Payload;
+
+    let dir = Builder::new().prefix("audit_fatal_gate").tempdir().unwrap();
+    let _scope = ambient::test_guard();
+    let field: PayloadKeyType = "color".parse().unwrap();
+
+    let mut segment = build_simple_segment_with_payload_storage(
+        dir.path(),
+        4,
+        Distance::Dot,
+        PayloadStorageType::default(),
+    )
+    .unwrap();
+    for i in 0..4u64 {
+        segment
+            .upsert_point(i + 1, i.into(), only_default_vector(&[1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        let payload: Payload =
+            serde_json::from_value(serde_json::json!({ "color": format!("c-{i}") })).unwrap();
+        segment
+            .set_full_payload(i + 10, i.into(), &payload)
+            .unwrap();
+    }
+    segment
+        .create_field_index(100, &field, Some(&PayloadSchemaType::Keyword.into()))
+        .unwrap();
+
+    // Soft-delete point 2, then re-add its posting directly, leaving a deleted point indexed.
+    segment.delete_point(200, 2.into()).unwrap();
+    {
+        let mut index = segment.payload_index.borrow_mut();
+        let indexes = index.field_indexes.get_mut(&field).unwrap();
+        for field_index in indexes.iter_mut() {
+            if matches!(field_index, FieldIndex::NullIndex(_)) {
+                continue;
+            }
+            let value = [serde_json::Value::String("c-2".to_string())];
+            let refs: Vec<&serde_json::Value> = value.iter().collect();
+            field_index.add_point(2, &refs).unwrap();
+        }
+    }
+
+    let report = audit_with_segment_uuid(
+        &segment.payload_index.borrow(),
+        &AuditPolicy::full(),
+        segment.uuid,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(report.highest_severity, Severity::Fatal);
+
+    // A repair plan exists for the field, but a live segment must refuse repair; publication gates
+    // treat Fatal as a hard abort rather than an auto-fix.
+    let plan = RepairPlan::from_report(&report);
+    let err = segment
+        .payload_index
+        .borrow_mut()
+        .repair_filter_indexes(&plan, SegmentLifecycle::Live, &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(err.to_string().contains("unpublished segment"));
+}

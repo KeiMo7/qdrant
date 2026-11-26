@@ -1,5 +1,6 @@
 mod condition_checker;
 pub mod field_index;
+pub mod filter_index_audit;
 pub mod hnsw_index;
 mod memory_reporter;
 pub mod payload_config;

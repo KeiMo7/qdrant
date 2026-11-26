@@ -493,6 +493,7 @@ mod tests {
                 &read.hnsw_config,
                 &Default::default(),
                 &read.quantization_config,
+                None,
             )
         };
 

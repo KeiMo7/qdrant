@@ -328,6 +328,8 @@ impl EdgeConfig {
             dense_vectors,
             sparse_vectors,
             live_vector_names: None,
+            live_payload_schema: Default::default(),
+            audit_policy: Default::default(),
             // The serverless indexer reads the built segment to meter and upload it, then deletes
             // it. Evicting its cache would only make both reads go to disk.
             cache_after_build: if cfg!(feature = "serverless") {

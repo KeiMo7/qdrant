@@ -77,6 +77,11 @@ impl MergeOptimizer {
     }
 
     #[cfg(any(test, feature = "testing"))]
+    pub fn segment_optimizer_config_mut_for_test(&mut self) -> &mut SegmentOptimizerConfig {
+        &mut self.segment_optimizer_config
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     pub fn set_default_segments_number_for_test(&mut self, value: usize) {
         self.default_segments_number = value;
     }
